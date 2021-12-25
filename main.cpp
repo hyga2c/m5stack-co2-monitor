@@ -6,13 +6,16 @@
 #include <WiFiClientSecure.h>
 #include <Wire.h>
 
+#include <ssl_client.h>// linenotify用にincludeする
+
 #define USE_EXTERNAL_SD_FOR_CONFIG
 // comment out USE_EXTERNAL_SD_FOR_CONFIG if you write config directly, and define config you use
 // #define USE_AMBIENT  // comment out if you don't use Ambient for logging
 // #define USE_PUSHBULLET  // comment out if you don't use PushBullet for notifying
+// #define USE_LINENOTIFY  // comment out if you don't use PushBullet for notifying
 
 // WiFi setting
-#if defined(USE_AMBIENT) || defined(USE_PUSHBULLET)
+#if defined(USE_AMBIENT) || defined(USE_PUSHBULLET) || defined(USE_LINENOTIFY)
 bool use_wifi = true;
 const char *ssid{"Write your ssid"};          // write your WiFi SSID (2.4GHz)
 const char *password{"Write your password"};  // write your WiFi password
@@ -39,13 +42,22 @@ const char *writeKey;    // dummy
 WiFiClientSecure secureClient;
 int notify_timer_caution = 0;
 int notify_timer_warning = 0;
-#define NOTIFY_TIMER_S 180  // send notification when CO2 keeps exceeding threshold this second
+#define NOTIFY_TIMER_S 600  // send notification when CO2 keeps exceeding threshold this second
 #ifdef USE_PUSHBULLET
 bool use_pushbullet = true;
 String pushbullet_apikey("Write your pushbullet api key");
 #else
 bool use_pushbullet = false;
 String pushbullet_apikey;
+#endif
+
+// linenotify setting
+#ifdef USE_LINENOTIFY
+bool use_linenotify = true;
+String linenotify_token("Write your linenotify token");
+#else
+bool use_linenotify = false;
+String linenotify_token;
 #endif
 
 // sensor setting
@@ -130,6 +142,43 @@ bool pushbullet(const String &message) {
     return false;
 }
 
+// send message with line notify ref https://elchika.com/article/78de98e6-009c-431e-8c37-93da656653d7/
+bool linenotify(const String &message) {
+  const char* host = "notify-api.line.me";
+  const char* token = linenotify_token.c_str();
+  WiFiClientSecure client;
+  Serial.println("Try");
+  //LineのAPIサーバに接続
+  client.setInsecure();
+  if (!client.connect(host, 443)) {
+    Serial.println("Connection failed");
+    return false;
+  }
+  Serial.println("Connected");
+  //リクエストを送信
+  String query = String("message=") + message;
+  String request = String("") +
+                   "POST /api/notify HTTP/1.1\r\n" +
+                   "Host: " + host + "\r\n" +
+                   "Authorization: Bearer " + token + "\r\n" +
+                   "Content-Length: " + String(query.length()) +  "\r\n" +
+                   "Content-Type: application/x-www-form-urlencoded\r\n\r\n" +
+                   query + "\r\n";
+  client.print(request);
+
+  //受信終了まで待つ
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    Serial.println(line);
+    if (line == "\r") {
+      break;
+    }
+  }
+
+  String line = client.readStringUntil('\n');
+  Serial.println(line);
+}
+
 int getPositionY(int ppm) {
     return SPRITE_HEIGHT - (int32_t)((float)SPRITE_HEIGHT / (co2_max_ppm - CO2_MIN_PPM) * ppm);
 }
@@ -145,6 +194,24 @@ bool notifyUser(int level) {
         case LEVEL_WARNING:
             sprintf(body, "CO2 exceeded %d ppm. Ventilate immediately.", co2_warning_ppm);
             return pushbullet(body);
+
+        default:
+            return false;
+    }
+}
+
+// add notifyUser with line notification
+bool notifyUser_l(int level) {
+    char body[100];
+
+    switch (level) {
+        case LEVEL_CAUTION:
+            sprintf(body, "CO2 exceeded %d ppm. Ventilate please.", co2_caution_ppm);
+            return linenotify(body);
+
+        case LEVEL_WARNING:
+            sprintf(body, "CO2 exceeded %d ppm. Ventilate immediately.", co2_warning_ppm);
+            return linenotify(body);
 
         default:
             return false;
@@ -231,6 +298,19 @@ void setup_with_external_SD() {
     }
 }
 
+    // linenotify
+    M5.Lcd.print("Linenotify setup...");
+    int linenotify_index = config_ini.indexOf("#LINE\r\n");
+    if (linenotify_index != -1) {
+        use_linenotify = true;
+        config_ini = config_ini.substring(config_ini.indexOf("#LINENOTIFY_APIKEY\r\n") + 20);
+        linenotify_token = config_ini.substring(0, config_ini.indexOf("\r\n"));
+        Serial.printf("Linenotify api key:%s\n", linenotify_token.c_str());
+        M5.Lcd.println("OK");
+    } else {
+        M5.Lcd.println("Skip");
+    }
+}
 void setup() {
     M5.begin();
     M5.Power.begin();
@@ -682,6 +762,28 @@ void loop() {
                 }
                 if (co2_level_now == LEVEL_WARNING) {
                     if (notifyUser(co2_level_now))
+                        Serial.println("notifyUser(): WARNING");
+                    else
+                        Serial.println("notifyUser(): failed!");
+                }
+            }
+
+            co2_level_last = co2_level_now;
+        }
+
+    if (use_linenotify) {
+            int co2_level_now = checkCo2Level(co2_level_last, co2_ppm);
+
+            // notify user when co2 level exceed threshold
+            if (co2_level_now > co2_level_last) {
+                if (co2_level_now == LEVEL_CAUTION) {
+                    if (notifyUser_l(co2_level_now))
+                        Serial.println("notifyUser(): CAUTION");
+                    else
+                        Serial.println("notifyUser(): failed!");
+                }
+                if (co2_level_now == LEVEL_WARNING) {
+                    if (notifyUser_l(co2_level_now))
                         Serial.println("notifyUser(): WARNING");
                     else
                         Serial.println("notifyUser(): failed!");
